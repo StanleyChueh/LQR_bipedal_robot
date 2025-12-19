@@ -1,18 +1,16 @@
-import time
 import mujoco
 import mujoco.viewer
+import pinocchio
+
+import time
 import numpy as np
 import yaml
 import argparse
-import pinocchio
-from scipy.linalg import solve_continuous_are
-from scipy.optimize import minimize
-import socket
-import json
-import threading
-import matplotlib.pyplot as plt
 
-NUM_MOTOR = 6
+from scipy.linalg import solve_continuous_are
+
+# drawing
+import matplotlib.pyplot as plt
 
 _pinocchio_model = None
 _pinocchio_data = None
@@ -27,12 +25,10 @@ def pd_control(target_q, q, kp, target_dq, dq, kd):
     return (target_q - q) * kp + (target_dq - dq) * kd
 
 def init_pinocchio_model():
-    """只在啟動時調用一次"""
     global _pinocchio_model, _pinocchio_data
     urdf_path = "/home/stanley/NTUT_master/crazydog_lqr_control/urdf/crazydog_urdf.urdf"
     _pinocchio_model = pinocchio.buildModelFromUrdf(urdf_path, pinocchio.JointModelFreeFlyer())
     
-    # 移除輪子質量
     for link in ["L_wheel", "R_wheel"]:
         fid = _pinocchio_model.getFrameId(link)
         jid = _pinocchio_model.frames[fid].parentJoint
@@ -41,17 +37,14 @@ def init_pinocchio_model():
     
     _pinocchio_data = _pinocchio_model.createData()
 
-# ======================================================
-# ----------  Pinocchio：自動計算質心 → 輪軸距離 l ----------
-# ======================================================
+# compute l from given joint angles
 def compute_COM_and_l(initial_angles):
-    """使用預載入的模型"""
+    # load model
     global _pinocchio_model, _pinocchio_data
 
     nq = _pinocchio_model.nq
     q = np.zeros(nq)
     
-    # base 固定在 0 0 0 + quaternion 1 0 0 0
     q[0:7] = np.array([0,0,0, 1,0,0,0])
 
     # joints = your initial_angles (6 motors)
@@ -64,12 +57,11 @@ def compute_COM_and_l(initial_angles):
     # ---------- COM ----------
     com = pinocchio.centerOfMass(_pinocchio_model, _pinocchio_data, q)
 
-    # ---------- 取輪軸中點 ----------
     pL = _pinocchio_data.oMf[_pinocchio_model.getFrameId("L_wheel")].translation
     pR = _pinocchio_data.oMf[_pinocchio_model.getFrameId("R_wheel")].translation
     p_axle = 0.5 * (pL + pR)
 
-    # ---------- 計算 COM 與輪軸距離 ----------
+    # compute l = ||COM - axle||
     delta = com - p_axle
     l = np.linalg.norm(delta[[0, 2]])  # 在 sagittal plane
 
@@ -80,121 +72,6 @@ def compute_COM_and_l(initial_angles):
     print("Computed l =", l)
     print("====================================\n")
 
-    return l
-
-def build_l_lookup_table(l_min=0.15, l_max=0.25, num_samples=30):
-    """預計算 l 值對應的關節角度查找表"""
-    print("\n===== 建立高度查找表 =====")
-    print(f"範圍: {l_min:.3f} - {l_max:.3f} m")
-    print(f"樣本數: {num_samples}")
-    print("正在計算...")
-    
-    l_values = np.linspace(l_min, l_max, num_samples)
-    angle_table = []
-    
-    for i, l_target in enumerate(l_values):
-        angles = find_angles_for_target_l(l_target)
-        angle_table.append(angles)
-        if (i + 1) % 5 == 0:
-            print(f"  進度: {i+1}/{num_samples} ({(i+1)/num_samples*100:.1f}%)")
-    
-    angle_table = np.array(angle_table)
-    print("查找表建立完成！")
-    print("========================\n")
-    return l_values, angle_table
-
-def interpolate_angles_from_l(l_target, l_values, angle_table):
-    """從查找表插值獲取關節角度（極快，<1ms）"""
-    # 對每個關節角度單獨插值
-    interpolated_angles = np.zeros(6)
-    for i in range(6):
-        interpolated_angles[i] = np.interp(l_target, l_values, angle_table[:, i])
-    return interpolated_angles
-
-def find_angles_for_target_l(target_l, initial_guess=None):
-    """使用優化方法尋找能達到目標 l 的關節角度"""
-
-    if initial_guess is None:
-        initial_guess = np.array([1.27, -2.127, 0, 1.27 , -2.127, 0])
-    # 你認為「自然」的 hip / knee 角度
-    hip_nat  = 1.27    # 可以自己調
-    knee_nat = -2.127   # 可以自己調
-
-    def objective(angles):
-        try:
-            l_current = compute_COM_and_l_silent(angles)
-
-            hip_L, knee_L, wheel_L, hip_R, knee_R, wheel_R = angles
-
-            # 1) 主要目標： l 接近 target_l
-            loss_l = (l_current - target_l)**2
-
-            # 2) 對稱懲罰
-            symmetry_penalty = (
-                (hip_L - hip_R)**2 +
-                (knee_L - knee_R)**2 +
-                (wheel_L - wheel_R)**2
-            )
-
-            # 3) 自然站姿懲罰：希望接近 (hip_nat, knee_nat)
-            # 左右兩邊都拉向同一個自然角
-            prior_penalty = (
-                (hip_L  - hip_nat )**2 +
-                (knee_L - knee_nat)**2 +
-                (hip_R  - hip_nat )**2 +
-                (knee_R - knee_nat)**2
-            )
-
-            # 權重自己調：越大越「黏著」自然站姿
-            w_sym   = 0.1
-            w_prior = 0.0001
-
-            return loss_l + w_sym * symmetry_penalty + w_prior * prior_penalty
-        except:
-            return 1e6
-    
-    # 關節限制（根據你的機器人規格調整）
-    bounds = [
-        (0, 1.5),      # hip joints
-        (-2.61, 0),     # knee joints  
-        (-0.5, 0.5),    # wheel joints
-        (0, 1.5), 
-        (-2.61, 0),
-        (-0.5, 0.5)
-    ]
-    
-    result = minimize(objective, initial_guess, bounds=bounds, method='L-BFGS-B')
-    
-    if result.success:
-        optimized_angles = result.x
-        achieved_l = compute_COM_and_l_silent(optimized_angles)
-        # print(f"優化結果: 目標 l={target_l:.4f}, 達成 l={achieved_l:.4f}")
-        # print(f"優化角度: {optimized_angles}")
-        return optimized_angles
-    else:
-        print(f"優化失敗，使用初始角度")
-        return initial_guess
-
-def compute_COM_and_l_silent(angles):
-    """不輸出信息的版本，用於優化"""
-    global _pinocchio_model, _pinocchio_data
-    
-    nq = _pinocchio_model.nq
-    q = np.zeros(nq)
-    q[0:7] = np.array([0,0,0, 1,0,0,0])
-    q[7:7+len(angles)] = angles
-
-    pinocchio.forwardKinematics(_pinocchio_model, _pinocchio_data, q)
-    pinocchio.updateFramePlacements(_pinocchio_model, _pinocchio_data)
-
-    com = pinocchio.centerOfMass(_pinocchio_model, _pinocchio_data, q)
-    pL = _pinocchio_data.oMf[_pinocchio_model.getFrameId("L_wheel")].translation
-    pR = _pinocchio_data.oMf[_pinocchio_model.getFrameId("R_wheel")].translation
-    p_axle = 0.5 * (pL + pR)
-
-    delta = com - p_axle
-    l = np.linalg.norm(delta[[0, 2]])
-    
     return l
 
 def build_LQR_6x6(l):
@@ -210,7 +87,6 @@ def build_LQR_6x6(l):
 
     J_delta = (1/12) * m_wheel * D_distance**2
 
-    # === 原本直立動態 ===
     Qeq = Jp*M_body + (Jp + M_body*l*l) * (2*m_wheel + 2*I_wheel/w_radius**2)
 
     A23 = -(M_body**2 * l**2 * g) / Qeq
@@ -266,12 +142,6 @@ def build_LQR_6x6(l):
     # solve CARE
     P = solve_continuous_are(A6, B6, Q, R)
     K = np.linalg.inv(R) @ B6.T @ P   # (2×6)
-
-    # print("===== LQR 6x6 Gain K (u_fwd,u_turn) =====")
-    # print(K)
-    # print(K.shape)
-    # print("=========================================\n")
-
     return K
 
 def lqr_6x6_full_step(m, d, dt, kps, kds, target_dof_pos, K, v_ref=0.0, yaw_rate_ref=0.0, delta_est=0.0):
@@ -298,8 +168,6 @@ def lqr_6x6_full_step(m, d, dt, kps, kds, target_dof_pos, K, v_ref=0.0, yaw_rate
         yaw_rate - yaw_rate_ref # yaw rate error
     ])
 
-    # print(f"vx={vx:.3f} (ref={v_ref:.3f}), gz={gz:.3f} (ref={yaw_rate_ref:.3f})")
-
     # control law
     u_vec = -K @ x_state
     u_fwd, u_turn = float(u_vec[0]), float(u_vec[1])
@@ -325,10 +193,6 @@ def lqr_6x6_full_step(m, d, dt, kps, kds, target_dof_pos, K, v_ref=0.0, yaw_rate
 
     return theta, theta_dot, u_vec, x_dot, delta_est
 
-
-# ======================================================
-# 主程式
-# ======================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("config_file", type=str)
@@ -348,25 +212,14 @@ if __name__ == "__main__":
 
     init_pinocchio_model()
 
-    # === Pinocchio 計算質心距離 l ===
     l_calculated = compute_COM_and_l(initial_angles)
 
-    # === 建立 LQR 控制器 ===
+    # === LQR controller ===
     K = build_LQR_6x6(l_calculated)
 
-    l_min = max(0.15, l_calculated - 0.10)
-    l_max = min(0.35, l_calculated + 0.10)
-    l_lookup_values, angle_lookup_table = build_l_lookup_table(l_min, l_max, num_samples=30)
-
     delta_est = 0.0
-    l_previous = l_calculated  # 記錄上一次的 l 值
-    
-    print("\n===== 控制說明 =====")
-    print("使用遙控器程序控制機器人：")
-    print("  python test.py config/crazydog.yaml")
-    print("==================\n")
 
-    # === MuJoCo 模型 ===
+    # === MuJoCo model ===
     m = mujoco.MjModel.from_xml_path(xml_path)
     d = mujoco.MjData(m)
     m.opt.timestep = simulation_dt
@@ -379,8 +232,7 @@ if __name__ == "__main__":
             step_start = time.time()
 
             v_ref = 0.0          
-            yaw_rate_ref = 0.0   
-            l_target = None      
+            yaw_rate_ref = 0.0      
             
             theta, theta_dot, u_vec, x_dot, delta_est = lqr_6x6_full_step(
                 m, d, m.opt.timestep,
@@ -401,7 +253,6 @@ if __name__ == "__main__":
             viewer.sync()
             time.sleep(max(0, m.opt.timestep - (time.time() - step_start)))
 
-    # ———— 繪圖（美化版） ————
     t = np.arange(len(theta_list)) * m.opt.timestep
 
     plt.figure(figsize=(12, 8))
@@ -430,7 +281,6 @@ if __name__ == "__main__":
     plt.legend(frameon=False)
     plt.grid(True, linestyle='--', alpha=0.4)
 
-    # === 全域調整 ===
     plt.suptitle("Pitch Dynamics and Control Signals", fontsize=14, y=0.98)
     plt.tight_layout()
     plt.show()
