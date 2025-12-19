@@ -45,5 +45,5 @@ def printSceneInformation(mj_model):
             index = index + mj_model.sensor_dim[i]
         print(" ")
 
-mj_model = mujoco.MjModel.from_xml_path('/home/csl/test/mujoco_course/crazydog_urdf/urdf/test.xml')
+mj_model = mujoco.MjModel.from_xml_path('crazydog.xml')
 printSceneInformation(mj_model)

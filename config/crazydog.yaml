@@ -1,0 +1,12 @@
+# 
+xml_path: "scene.xml"
+
+# Total simulation time
+simulation_duration: 300.0
+# Simulation time step
+simulation_dt: 0.002
+
+kps: [50, 50,  0, 50, 50, 0]
+kds: [3.5, 3.5, 0.3, 3.5, 3.5, 0.3]
+
+initial_angles: [1.27, -2.127, 0, 1.27 , -2.127, 0]
