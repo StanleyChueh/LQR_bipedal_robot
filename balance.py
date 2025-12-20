@@ -1,3 +1,4 @@
+#python balance.py config/crazydog.yaml
 import mujoco
 import mujoco.viewer
 import pinocchio
@@ -26,7 +27,7 @@ def pd_control(target_q, q, kp, target_dq, dq, kd):
 
 def init_pinocchio_model():
     global _pinocchio_model, _pinocchio_data
-    urdf_path = "/home/stanley/NTUT_master/crazydog_lqr_control/urdf/crazydog_urdf.urdf"
+    urdf_path = "/home/stanley/NTUT_master/final/LQR_bipedal_robot/urdf/crazydog_urdf.urdf"
     _pinocchio_model = pinocchio.buildModelFromUrdf(urdf_path, pinocchio.JointModelFreeFlyer())
     
     for link in ["L_wheel", "R_wheel"]:
